@@ -9,10 +9,11 @@ permissions:
 
 jobs:
   verify:
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [macos-latest, ubuntu-latest]
         node: [22, 24]
 
     steps:
