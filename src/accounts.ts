@@ -33,6 +33,7 @@ import {
   ensurePrivateDir,
 } from './paths.js';
 import { childOwned, ProcessTracker, runProcess } from './processes.js';
+import { prepareTrash, withLeftoverReservation, type TrashOptions } from './trash.js';
 import type { Confirm } from './prompt.js';
 import { CodexAdapter, identityHash, maskEmail } from './providers/codex.js';
 import { MIN_CLAUDE_MULTI_ACCOUNT_VERSION } from './providers/claude-live.js';
@@ -373,7 +374,15 @@ async function markerMatches(account: AccountConfig): Promise<boolean> {
 export async function removeAccount(
   store: ConfigStore,
   selector: string,
-  options: { purge?: boolean; confirm: Confirm; tracker?: ProcessTracker },
+  options: {
+    purge?: boolean;
+    confirm: Confirm;
+    tracker?: ProcessTracker;
+    /** Test seam: chooses the trash flavour and preflight order; defaults to process.platform. */
+    platform?: NodeJS.Platform;
+    /** Test seam for injecting Trash filesystem failures. */
+    trashFs?: TrashOptions['fs'];
+  },
 ): Promise<{ messages: string[] }> {
   const match = /^(codex|claude):([a-z0-9_-]+)$/.exec(selector);
   if (!match)
@@ -407,24 +416,47 @@ export async function removeAccount(
       provider === 'codex' ? config.defaults.codexExecutable : config.defaults.claudeExecutable,
       provider,
     );
-    const logout = await runProcess(
-      executable,
-      provider === 'codex' ? ['logout'] : ['auth', 'logout'],
-      {
-        env: vendorEnvironment(provider, account.stateDir, process.env, {
-          claudeDefault: account.claudeDefault,
-        }),
-        timeoutMs: 30_000,
-        tracker,
-      },
-    );
-    if (logout.code !== 0) {
-      throw new UsageError('provider_failure', `${provider} logout failed; state was not moved`);
+    const platform = options.platform ?? process.platform;
+    const trashName = `usage-${provider}-${label}-${randomUUID()}`;
+    const trashOptions: TrashOptions = {
+      platform,
+      ...(options.trashFs === undefined ? {} : { fs: options.trashFs }),
+    };
+    // Linux validates and reserves the freedesktop Trash entry before logging out.
+    const preflight =
+      platform === 'linux'
+        ? await prepareTrash(store.paths, account.stateDir, trashName, trashOptions)
+        : undefined;
+    try {
+      const logout = await runProcess(
+        executable,
+        provider === 'codex' ? ['logout'] : ['auth', 'logout'],
+        {
+          env: vendorEnvironment(provider, account.stateDir, process.env, {
+            claudeDefault: account.claudeDefault,
+          }),
+          timeoutMs: 30_000,
+          tracker,
+        },
+      );
+      if (logout.code !== 0) {
+        throw new UsageError('provider_failure', `${provider} logout failed; state was not moved`);
+      }
+    } catch (error) {
+      // Release the reservation on every logout failure (exit code, timeout, spawn error).
+      // The logout error stays primary; if the release fails, it names the leftover file.
+      const leftover = await preflight?.abort().then(
+        () => undefined,
+        () => preflight.reservation,
+      );
+      throw leftover === undefined ? error : withLeftoverReservation(error, leftover);
     }
-    await ensurePrivateDir(store.paths.trashDir);
-    const trash = join(store.paths.trashDir, `usage-${provider}-${label}-${randomUUID()}`);
-    await rename(account.stateDir, trash);
-    messages.push(`Moved ${account.stateDir} to ${trash}; it is recoverable from Trash.`);
+    const move =
+      preflight ?? (await prepareTrash(store.paths, account.stateDir, trashName, trashOptions));
+    await move.commit();
+    messages.push(
+      `Moved ${account.stateDir} to ${move.destination}; it is recoverable from Trash.`,
+    );
   }
   const accounts = config.accounts.filter(
     (item) => item.provider !== provider || item.label !== label,

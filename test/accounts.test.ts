@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   symlink,
@@ -19,6 +20,7 @@ import {
   restoreClaudeCollector,
 } from '../src/accounts.js';
 import { ConfigStore, DEFAULT_CONFIG } from '../src/config.js';
+import { UsageError } from '../src/errors.js';
 import { appPaths } from '../src/paths.js';
 import type { AccountConfig, UsageConfig } from '../src/types.js';
 
@@ -235,5 +237,274 @@ describe('removal and purge guards', () => {
         () => false,
       ),
     ).toBe(false);
+  });
+});
+
+describe('purge on Linux (freedesktop trash)', () => {
+  async function linuxPurgeSetup(
+    script: string,
+    executable?: string,
+  ): Promise<{
+    store: ConfigStore;
+    stateDir: string;
+    called: string;
+  }> {
+    const home = await realpath(await mkdtemp(join(tmpdir(), 'accounts-linux-')));
+    const store = new ConfigStore(appPaths(home, { platform: 'linux', env: {} }));
+    const stateDir = join(store.paths.managedRoot, 'codex', 'personal');
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, '.usage-owner'), JSON.stringify({ id: 'marker' }), {
+      mode: 0o600,
+    });
+    const called = join(home, 'vendor-called');
+    const fake = join(store.paths.dataDir, 'codex');
+    await writeFile(fake, executable ?? `#!/bin/sh\ntouch '${called}'\n${script}\n`);
+    await chmod(fake, 0o700);
+    const account: AccountConfig = {
+      provider: 'codex',
+      label: 'personal',
+      stateDir,
+      ownership: 'managed',
+      ownershipMarker: 'marker',
+    };
+    await store.write(
+      {
+        ...DEFAULT_CONFIG,
+        defaults: { ...DEFAULT_CONFIG.defaults, codexExecutable: fake },
+        accounts: [account],
+      },
+      false,
+    );
+    return { store, stateDir, called };
+  }
+
+  const exists = (path: string): Promise<boolean> =>
+    lstat(path).then(
+      () => true,
+      () => false,
+    );
+
+  it('linux purge moves state to the freedesktop trash', async () => {
+    const { store, stateDir, called } = await linuxPurgeSetup('exit 0');
+    const result = await removeAccount(store, 'codex:personal', {
+      purge: true,
+      confirm: async () => true,
+      platform: 'linux',
+    });
+    expect(await exists(called)).toBe(true);
+    expect(result.messages.join(' ')).toContain('recoverable from Trash');
+    expect(await exists(stateDir)).toBe(false);
+    const files = await readdir(join(store.paths.trashDir, 'files'));
+    const infos = await readdir(join(store.paths.trashDir, 'info'));
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^usage-codex-personal-/);
+    expect(infos).toEqual([`${files[0]}.trashinfo`]);
+    expect(await exists(join(store.paths.trashDir, 'files', files[0] ?? '', '.usage-owner'))).toBe(
+      true,
+    );
+    expect(result.messages.join(' ')).toContain(
+      join(store.paths.trashDir, 'files', files[0] ?? ''),
+    );
+    expect((await store.load()).accounts).toHaveLength(0);
+  });
+
+  it('preflight failure skips logout (linux)', async () => {
+    const { store, stateDir, called } = await linuxPurgeSetup('exit 0');
+    await mkdir(store.paths.trashDir, { recursive: true });
+    await writeFile(join(store.paths.trashDir, 'files'), 'not a directory');
+    await expect(
+      removeAccount(store, 'codex:personal', {
+        purge: true,
+        confirm: async () => true,
+        platform: 'linux',
+      }),
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof UsageError &&
+        error.message ===
+          `Could not prepare Trash ${store.paths.trashDir}: EEXIST; the account was not logged out and its directory was not moved`,
+    );
+    expect(await exists(called)).toBe(false);
+    expect(await exists(stateDir)).toBe(true);
+    expect((await store.load()).accounts).toHaveLength(1);
+  });
+
+  it('logout failure leaves no trashinfo (linux)', async () => {
+    const { store, stateDir, called } = await linuxPurgeSetup('exit 1');
+    await expect(
+      removeAccount(store, 'codex:personal', {
+        purge: true,
+        confirm: async () => true,
+        platform: 'linux',
+      }),
+    ).rejects.toThrow('logout failed; state was not moved');
+    expect(await exists(called)).toBe(true);
+    expect(await readdir(join(store.paths.trashDir, 'info'))).toEqual([]);
+    expect(await readdir(join(store.paths.trashDir, 'files'))).toEqual([]);
+    expect(await exists(stateDir)).toBe(true);
+    expect((await store.load()).accounts).toHaveLength(1);
+  });
+
+  it('a vendor spawn failure releases the trash reservation (linux)', async () => {
+    // The shebang interpreter is missing, so the spawn itself fails after resolution.
+    const { store, stateDir } = await linuxPurgeSetup('', '#!/nonexistent/interpreter\n');
+    await expect(
+      removeAccount(store, 'codex:personal', {
+        purge: true,
+        confirm: async () => true,
+        platform: 'linux',
+      }),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readdir(join(store.paths.trashDir, 'info'))).toEqual([]);
+    expect(await readdir(join(store.paths.trashDir, 'files'))).toEqual([]);
+    expect(await exists(join(stateDir, '.usage-owner'))).toBe(true);
+    expect((await store.load()).accounts).toHaveLength(1);
+  });
+
+  it('an unreadable stale-destination check refuses before logout (linux)', async () => {
+    const { store, stateDir, called } = await linuxPurgeSetup('exit 0');
+    await expect(
+      removeAccount(store, 'codex:personal', {
+        purge: true,
+        confirm: async () => true,
+        platform: 'linux',
+        trashFs: {
+          lstat: async () => {
+            throw Object.assign(new Error('secret detail'), { code: 'EACCES' });
+          },
+        },
+      }),
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        error instanceof UsageError &&
+        error.message ===
+          `Could not prepare Trash ${store.paths.trashDir}: EACCES; the account was not logged out and its directory was not moved`,
+    );
+    expect(await exists(called)).toBe(false);
+    expect(await readdir(join(store.paths.trashDir, 'info'))).toEqual([]);
+    expect(await exists(join(stateDir, '.usage-owner'))).toBe(true);
+    expect((await store.load()).accounts).toHaveLength(1);
+  });
+
+  it('a logout failure names a reservation it could not release (linux)', async () => {
+    const { store, stateDir } = await linuxPurgeSetup('exit 1');
+    const error = await removeAccount(store, 'codex:personal', {
+      purge: true,
+      confirm: async () => true,
+      platform: 'linux',
+      trashFs: {
+        unlink: async () => {
+          throw Object.assign(new Error('secret detail'), { code: 'EACCES' });
+        },
+      },
+    }).catch((caught: unknown) => caught);
+    const infos = await readdir(join(store.paths.trashDir, 'info'));
+    expect(infos).toHaveLength(1);
+    const leftover = join(store.paths.trashDir, 'info', infos[0] ?? '');
+    expect(error).toBeInstanceOf(UsageError);
+    expect((error as UsageError).data.code).toBe('provider_failure');
+    expect((error as UsageError).message).toBe(
+      `codex logout failed; state was not moved; the Trash reservation ${leftover} could not be removed`,
+    );
+    expect((error as UsageError).data.message).toBe((error as UsageError).message);
+    expect(await exists(join(stateDir, '.usage-owner'))).toBe(true);
+    expect((await store.load()).accounts).toHaveLength(1);
+  });
+
+  it('a spawn failure keeps its code and names an unreleased reservation (linux)', async () => {
+    const { store } = await linuxPurgeSetup('', '#!/nonexistent/interpreter\n');
+    const error = await removeAccount(store, 'codex:personal', {
+      purge: true,
+      confirm: async () => true,
+      platform: 'linux',
+      trashFs: {
+        unlink: async () => {
+          throw Object.assign(new Error('secret detail'), { code: 'EACCES' });
+        },
+      },
+    }).catch((caught: unknown) => caught);
+    const infos = await readdir(join(store.paths.trashDir, 'info'));
+    const leftover = join(store.paths.trashDir, 'info', infos[0] ?? '');
+    expect(error).toMatchObject({ code: 'ENOENT' });
+    expect((error as Error).message).toContain(
+      `; the Trash reservation ${leftover} could not be removed`,
+    );
+  });
+});
+
+describe('purge on macOS (darwin trash order)', () => {
+  async function darwinPurgeSetup(script: string): Promise<{
+    store: ConfigStore;
+    stateDir: string;
+    called: string;
+    home: string;
+  }> {
+    const home = await realpath(await mkdtemp(join(tmpdir(), 'accounts-darwin-')));
+    const store = new ConfigStore(appPaths(home, { platform: 'darwin', env: {} }));
+    const stateDir = join(store.paths.managedRoot, 'codex', 'personal');
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, '.usage-owner'), JSON.stringify({ id: 'marker' }), {
+      mode: 0o600,
+    });
+    const called = join(home, 'vendor-called');
+    const fake = join(store.paths.dataDir, 'codex');
+    await writeFile(fake, `#!/bin/sh\ntouch '${called}'\n${script}\n`);
+    await chmod(fake, 0o700);
+    const account: AccountConfig = {
+      provider: 'codex',
+      label: 'personal',
+      stateDir,
+      ownership: 'managed',
+      ownershipMarker: 'marker',
+    };
+    await store.write(
+      {
+        ...DEFAULT_CONFIG,
+        defaults: { ...DEFAULT_CONFIG.defaults, codexExecutable: fake },
+        accounts: [account],
+      },
+      false,
+    );
+    return { store, stateDir, called, home };
+  }
+
+  const exists = (path: string): Promise<boolean> =>
+    lstat(path).then(
+      () => true,
+      () => false,
+    );
+
+  it('darwin purge logs out, then moves state into ~/.Trash', async () => {
+    const { store, stateDir, called, home } = await darwinPurgeSetup('exit 0');
+    const result = await removeAccount(store, 'codex:personal', {
+      purge: true,
+      confirm: async () => true,
+      platform: 'darwin',
+    });
+    expect(await exists(called)).toBe(true);
+    expect(await exists(stateDir)).toBe(false);
+    const entries = await readdir(join(home, '.Trash'));
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatch(/^usage-codex-personal-/);
+    expect(await exists(join(home, '.Trash', entries[0] ?? '', '.usage-owner'))).toBe(true);
+    expect(result.messages.join(' ')).toContain(
+      `Moved ${stateDir} to ${join(home, '.Trash', entries[0] ?? '')}; it is recoverable from Trash.`,
+    );
+    expect((await store.load()).accounts).toHaveLength(0);
+  });
+
+  it('darwin logout failure creates no Trash and keeps the account', async () => {
+    const { store, stateDir, called, home } = await darwinPurgeSetup('exit 1');
+    await expect(
+      removeAccount(store, 'codex:personal', {
+        purge: true,
+        confirm: async () => true,
+        platform: 'darwin',
+      }),
+    ).rejects.toThrow('codex logout failed; state was not moved');
+    expect(await exists(called)).toBe(true);
+    expect(await exists(join(home, '.Trash'))).toBe(false);
+    expect(await exists(join(stateDir, '.usage-owner'))).toBe(true);
+    expect((await store.load()).accounts).toHaveLength(1);
   });
 });
