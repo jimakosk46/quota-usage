@@ -6,8 +6,8 @@ This file applies to the entire repository. Read it before changing code, then r
 
 ## Product boundary
 
-`quota-usage` is a macOS-only Node.js CLI for ChatGPT Codex and Claude Code
-**subscription quota windows**. It is not an API billing, spend, token-cost, or
+`quota-usage` is a Node.js CLI for macOS and Linux that reports ChatGPT Codex and
+Claude Code **subscription quota windows**. It is not an API billing, spend, token-cost, or
 API rate-limit tool. The binary is `usage`; the package is `quota-usage`.
 
 These invariants are settled:
@@ -34,19 +34,27 @@ These invariants are settled:
 - High usage and reached limits never cause a failure exit code.
 - Preserve successful account results when another account fails.
 - Never read or expose credentials, OAuth tokens, API keys, Claude Keychain
-  secrets, Codex `auth.json`, Claude `.credentials.json`, or raw Claude terminal
-  captures.
+  secrets, Linux keyring secrets, Codex `auth.json`, Claude `.credentials.json`,
+  or raw Claude terminal captures.
 - Let the official vendor CLIs own login, refresh, and logout.
 - Track and clean up only processes started by this program. Never discover,
   attach to, or terminate unrelated provider processes.
-- Do not access a real account, live quota endpoint, Keychain, or real Claude
-  status-line setting in automated tests. A real-account smoke test requires
+- Do not access a real account, live quota endpoint, Keychain, keyring, or real
+  Claude status-line setting in automated tests. A real-account smoke test requires
   explicit user permission. Update tests use temporary local Git remotes and fake
   builds; disable auto-update in unrelated CLI tests.
 
 ## Working conventions
 
-- Runtime target: macOS, Node.js 22+, strict TypeScript, ESM.
+- Runtime target: macOS and Linux, Node.js 22+, strict TypeScript, ESM. Keep
+  platform differences in `appPaths` (XDG base directories on Linux; macOS
+  ignores them), `src/trash.ts` (macOS `~/.Trash`, freedesktop.org home trash
+  on Linux), and the Linux preflight order in `removeAccount` (`src/accounts.ts`).
+  Purge never deletes the account state directory permanently. On Linux it
+  reserves the trash entry before logout; if that preparation fails or the trash
+  is on another filesystem, it stops before logout, and the account stays
+  registered and logged in with its directory not moved. A failed logout releases
+  the reservation; if that fails, the error names the leftover `.trashinfo` file.
 - Direct dependency versions are exact. Keep runtime dependencies small and
   update `package-lock.json` with any dependency change.
 - Use `UsageError` and the stable error codes in `src/types.ts`; public error

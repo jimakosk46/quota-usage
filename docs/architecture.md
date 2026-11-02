@@ -31,8 +31,8 @@ document to stdout and must never contain progress text or ANSI escapes.
 | -------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | CLI wiring     | `src/cli.ts`                                                | Commander options and commands, output routing, signal cleanup                             |
 | Public model   | `src/types.ts`, `src/errors.ts`                             | Normalized quotas, account/config types, stable error contract                             |
-| Configuration  | `src/config.ts`, `src/paths.ts`                             | Strict YAML validation, atomic writes, permissions, canonical paths                        |
-| Accounts       | `src/accounts.ts`                                           | Registration, identity setup, Claude collector install/restore, removal/purge              |
+| Configuration  | `src/config.ts`, `src/paths.ts`                             | Strict YAML validation, atomic writes, permissions, canonical and platform paths           |
+| Accounts       | `src/accounts.ts`, `src/trash.ts`                           | Registration, identity setup, Claude collector install/restore, removal/purge to Trash     |
 | Discovery      | `src/discovery.ts`                                          | Directory inventory, explicit-registration precedence, directory-specific cache identities |
 | Account state  | `src/account-state.ts`                                      | Read-only directory metadata and availability guards before provider launches and output   |
 | Collection     | `src/collect.ts`, `src/selectors.ts`                        | Selection, concurrency, cache fallback, result sorting, exit aggregation                   |
@@ -105,12 +105,27 @@ keys and explicit OAuth-token environment variables are removed in both cases.
 ~/.local/share/usage/                directories 0700
 ~/.local/share/usage/accounts/       managed vendor state
 ~/.local/share/usage/bin/            compiled collector and owner-only backups
-~/Library/Caches/usage/              cache files 0600
+~/Library/Caches/usage/              cache files 0600 (macOS)
+~/.cache/usage/                      cache files 0600 (Linux, default)
 ```
 
+`appPaths` in `src/paths.ts` decides these locations. On Linux, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_CACHE_HOME` replace
+`~/.config`, `~/.local/share`, and `~/.cache` when set to non-empty absolute
+paths; macOS ignores them. Vendor state directories do not change.
+
 Managed purge requires the exact expected path, no symlinks, a matching random
-ownership marker, successful official logout, and a collision-safe move to
-macOS Trash. External/default state is never purged.
+ownership marker, successful official logout, and a collision-safe move to the
+Trash (`src/trash.ts`). macOS renames into `~/.Trash`. Linux follows the
+freedesktop.org trash layout in `$XDG_DATA_HOME/Trash`: it creates
+`info/<name>.trashinfo` exclusively before logout, refuses a trash on another
+device before logout (the account stays registered and logged in and its
+directory is not moved), releases the reservation if logout fails, then renames
+into `files/<name>`. Unexpected filesystem errors during preparation report only
+the errno code; any error other than `ENOENT` while checking for a stale
+`files/<name>` also stops before logout. A failed cleanup never replaces the
+primary error: if the reservation cannot be released after a failed preparation,
+logout, or move, the error names the leftover `.trashinfo` file. External/default state is never purged, and the account state
+directory is never deleted permanently.
 
 ## Packaging
 
