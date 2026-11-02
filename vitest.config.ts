@@ -5,6 +5,7 @@ export default defineConfig({
     environment: 'node',
     fileParallelism: false,
     testTimeout: 15_000,
+    setupFiles: ['test/setup-env.ts'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'json-summary'],

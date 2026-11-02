@@ -16,9 +16,23 @@ export interface AppPaths {
   trashDir: string;
 }
 
-export function appPaths(home = homedir()): AppPaths {
-  const configDir = join(home, '.config', 'usage');
-  const dataDir = join(home, '.local', 'share', 'usage');
+export interface AppPathsOptions {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+}
+
+export function appPaths(home = homedir(), options: AppPathsOptions = {}): AppPaths {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const linux = platform === 'linux';
+  // XDG Base Directory: only non-empty absolute values count; others fall back.
+  const base = (name: string, fallback: string): string => {
+    const value = env[name];
+    return linux && value && isAbsolute(value) ? value : join(home, fallback);
+  };
+  const configDir = join(base('XDG_CONFIG_HOME', '.config'), 'usage');
+  const dataHome = base('XDG_DATA_HOME', join('.local', 'share'));
+  const dataDir = join(dataHome, 'usage');
   return {
     homeDir: home,
     configDir,
@@ -27,8 +41,10 @@ export function appPaths(home = homedir()): AppPaths {
     dataDir,
     managedRoot: join(dataDir, 'accounts'),
     binDir: join(dataDir, 'bin'),
-    cacheDir: join(home, 'Library', 'Caches', 'usage'),
-    trashDir: join(home, '.Trash'),
+    cacheDir: linux
+      ? join(base('XDG_CACHE_HOME', '.cache'), 'usage')
+      : join(home, 'Library', 'Caches', 'usage'),
+    trashDir: linux ? join(dataHome, 'Trash') : join(home, '.Trash'),
   };
 }
 
