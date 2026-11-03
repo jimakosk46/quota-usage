@@ -1,12 +1,12 @@
 # quota-usage
 
-`quota-usage` is a macOS command-line tool that reports ChatGPT Codex and Claude Code subscription quota windows across automatically detected and explicitly registered accounts. The executable is named `usage`.
+`quota-usage` is a command-line tool for macOS and Linux that reports ChatGPT Codex and Claude Code subscription quota windows across automatically detected and explicitly registered accounts. The executable is named `usage`.
 
 It reports subscription allowance usage, reset times, plan metadata, and provider-supplied credits. It does **not** report API billing, API spend, token costs, or API rate limits. High usage and reached limits are information only; there are no thresholds and no `check` command.
 
 ## Requirements
 
-- macOS on Apple Silicon or Intel
+- macOS on Apple Silicon or Intel, or Linux (see [Linux](#linux))
 - Node.js 22 or newer
 - The official `codex` and/or `claude` CLI for the providers you use
 - Codex CLI 0.150.1 or newer
@@ -133,9 +133,9 @@ usage accounts add codex client --create
 usage accounts add claude client --create
 ```
 
-Managed state lives under `~/.local/share/usage/accounts/<provider>/<label>/`. `usage` creates a random ownership marker, then launches the official vendor login under that exact state directory. Vendor CLIs continue to own credentials, refresh, and logout.
+Managed state lives under `~/.local/share/usage/accounts/<provider>/<label>/` (on Linux, under `$XDG_DATA_HOME/usage/accounts/` when set to a non-empty absolute path; see [Local files](#local-files)). `usage` creates a random ownership marker, then launches the official vendor login under that exact state directory. Vendor CLIs continue to own credentials, refresh, and logout.
 
-Claude setup previews its `settings.json` status-line change and asks for confirmation. It saves the prior setting in owner-only application state, installs a compiled collector under `~/.local/share/usage/bin/`, and configures a label-specific wrapper. The status-line cache remains the fallback when live collection fails.
+Claude setup previews its `settings.json` status-line change and asks for confirmation. It saves the prior setting in owner-only application state, installs a compiled collector under `~/.local/share/usage/bin/` (on Linux, `$XDG_DATA_HOME/usage/bin/` when `XDG_DATA_HOME` is set to an absolute path), and configures a label-specific wrapper. The status-line cache remains the fallback when live collection fails.
 
 ## Collect usage
 
@@ -322,7 +322,7 @@ The parser accepts only named current-session and current-week rows. Activity st
 
 ## Credentials, privacy, and processes
 
-`usage` never reads, copies, prints, or stores Codex `auth.json`, Claude `.credentials.json`, OAuth access or refresh tokens, API keys, setup tokens, or Keychain secrets. It never invokes macOS `security` or queries Keychain directly. Official vendor CLIs own login, refresh, and logout.
+`usage` never reads, copies, prints, or stores Codex `auth.json`, Claude `.credentials.json`, OAuth access or refresh tokens, API keys, setup tokens, Keychain secrets, or keyring secrets. On macOS it never invokes `security` or queries Keychain directly; on Linux it never queries a keyring or Secret Service directly. Official vendor CLIs own login, refresh, and logout.
 
 Codex identity matching stores SHA-256 of a consistently normalized email, never the plaintext email. Normal output shows local labels. Claude identity is its local label bound to a canonical stable configuration directory.
 
@@ -332,6 +332,8 @@ There is no daemon or resident service. Provider processes exist only during act
 
 ## Local files
 
+On macOS:
+
 ```text
 Configuration:  ~/.config/usage/config.yaml
 Backup:         ~/.config/usage/config.yaml.bak
@@ -339,6 +341,24 @@ Managed state:  ~/.local/share/usage/accounts/
 Helper files:   ~/.local/share/usage/bin/
 Cache:          ~/Library/Caches/usage/
 Update state:   ~/.local/share/usage/updates/<checkout-hash>/
+Purge Trash:    ~/.Trash/
+```
+
+On Linux, the XDG base directories apply. Each variable is used only when it is set
+to a non-empty absolute path; otherwise its default is used. macOS ignores them.
+
+```text
+Configuration:  $XDG_CONFIG_HOME/usage/config.yaml
+Backup:         $XDG_CONFIG_HOME/usage/config.yaml.bak
+Managed state:  $XDG_DATA_HOME/usage/accounts/
+Helper files:   $XDG_DATA_HOME/usage/bin/
+Cache:          $XDG_CACHE_HOME/usage/
+Update state:   $XDG_DATA_HOME/usage/updates/<checkout-hash>/
+Purge Trash:    $XDG_DATA_HOME/Trash/
+
+XDG_CONFIG_HOME defaults to ~/.config
+XDG_DATA_HOME   defaults to ~/.local/share
+XDG_CACHE_HOME  defaults to ~/.cache
 ```
 
 Application directories use mode `0700`. Configuration, backup, ownership, collector-backup, and cache files use `0600`. YAML has top-level `schemaVersion: 1`, is completely validated before use, rejects unknown fields with their YAML path, and supports careful manual edits. Writes are atomic and retain one previous backup.
@@ -364,7 +384,7 @@ If the user changed Claude's setting afterward, `usage` does not overwrite it. I
 usage accounts remove codex:client --purge
 ```
 
-It refuses default/external state, missing or mismatched ownership markers, symlinks, broad paths, and locations outside the managed root. After confirmation it asks the official vendor CLI to log out under the exact directory. If logout fails, state is not moved. A successful purge moves the directory to macOS Trash with a collision-safe name and reports that it is recoverable. There is no `--force`.
+It refuses default/external state, missing or mismatched ownership markers, symlinks, broad paths, and locations outside the managed root. After confirmation it asks the official vendor CLI to log out under the exact directory. If logout fails, state is not moved. A successful purge moves the directory to the Trash with a collision-safe name and reports that it is recoverable: `~/.Trash` on macOS, the freedesktop.org home trash on Linux (see [Linux](#linux)). It never deletes the directory permanently. There is no `--force`.
 
 Prepare for npm removal with:
 
@@ -403,6 +423,45 @@ Common fixes:
 - Collector drift: follow the exact manual cleanup instruction without overwriting the newer Claude setting.
 - Claude live failure: retry with `--verbose`; a usable cache remains available when the noninteractive command fails.
 
+## Linux
+
+Linux uses the same commands, discovery rules, and vendor CLIs as macOS. Only local
+paths and purge differ.
+
+- Paths follow the XDG base directories listed in [Local files](#local-files).
+  Vendor state directories (`~/.codex`, `~/.claude`, `CODEX_HOME`,
+  `CLAUDE_CONFIG_DIR`) are unchanged.
+- `usage` does not move its files when an XDG variable changes; set them before
+  first use or set them back. Each variable has a separate effect:
+  - `XDG_CONFIG_HOME`: `usage` reads `config.yaml` from the new location.
+    Registrations in the old configuration are not loaded from the new location;
+    restoring the previous value makes them available again.
+  - `XDG_DATA_HOME`: new managed accounts go under the new `usage/accounts/`
+    directory, and purge uses the new `Trash` directory. Existing managed
+    registrations keep their recorded state directories, but purge refuses them
+    because they are no longer at the expected managed path.
+  - `XDG_CACHE_HOME`: an installed Claude collector keeps writing to the cache
+    path recorded in its status-line command, while `usage` reads caches from
+    the new location, so that cache is not found until the variable is set back.
+- The official vendor CLIs own credential storage, login, refresh, and logout.
+  `usage` never reads credential files or keyrings.
+- `--purge` moves managed state into the freedesktop.org home trash
+  (`$XDG_DATA_HOME/Trash`). It reserves the `info/<name>.trashinfo` entry before
+  asking the vendor CLI to log out, then moves the directory to `files/<name>`,
+  with metadata recording its original path for restoration. If the trash is on
+  another filesystem than the account, or the trash entry cannot be prepared, purge
+  stops before logout: it does not invoke logout, keeps the registration and
+  leaves the directory in place. A failed logout releases the reservation; if that fails,
+  the error names the leftover `.trashinfo` file. If the final move fails, the
+  directory stays where it was and the error says so, naming the leftover
+  `.trashinfo` file if it could not be removed. The account state directory is
+  never deleted permanently.
+
+Tested on Ubuntu 24.04 x86_64 with Node.js 22.23.4, Claude Code 2.1.316, and Codex
+CLI 0.166.0: discovery, `--plain`, `--json`, `--cached`, and `doctor`.
+Not verified: other distributions, ARM64, Alpine/musl, and WSL2. WSL2 counts as
+Linux when it runs the Linux builds of Node.js and the vendor CLIs.
+
 ## Development
 
 New contributors and coding agents should start with [AGENTS.md](AGENTS.md), the
@@ -420,14 +479,13 @@ npm run build
 npm pack --dry-run
 ```
 
-Tests use temporary directories, protocol fixtures, fake vendor executables, and local Git remotes with fake builds. Unrelated CLI tests disable checkout updates. They do not touch real vendor state, credentials, Keychain, status-line settings, or live quota endpoints.
+Tests use temporary directories, protocol fixtures, fake vendor executables, and local Git remotes with fake builds. Unrelated CLI tests disable checkout updates. They do not touch real vendor state, credentials, Keychain or keyring, status-line settings, or live quota endpoints. CI runs the full check sequence on macOS and Ubuntu with Node.js 22 and 24.
 
 Real-account verification is manual only. Do not run it without explicit permission. When authorized, smoke test with deliberately selected registrations by exercising default/cached/live/JSON output, running doctor, and removing any temporary registrations. Claude setup changes its status-line configuration after a confirmation, and live checks read current subscription state.
 
 ## Roadmap
 
 - Quota history
-- Linux support
 - Loading animation
 - More providers
 

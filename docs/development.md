@@ -2,7 +2,7 @@
 
 ## Setup and fast feedback
 
-Use macOS with Node.js 22 or newer:
+Use macOS or Linux with Node.js 22 or newer:
 
 ```sh
 npm ci
@@ -28,10 +28,15 @@ npm run pack:check
 
 ## Test safety
 
-Automated tests must not touch real provider state, credentials, Keychain,
-status-line configuration, or quota endpoints. Follow existing patterns:
+Automated tests must not touch real provider state, credentials, Keychain or
+keyring, status-line configuration, or quota endpoints. Follow existing patterns:
 
 - `mkdtemp` plus `appPaths(tempHome)` for filesystem/config tests.
+  `test/setup-env.ts` removes the runner's `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and
+  `XDG_CACHE_HOME` so Linux runs stay in the temporary home; pass `{ platform, env }` to `appPaths` to test either
+  platform's layout.
+- `src/trash.ts` takes injected `platform`, `now`, and filesystem functions;
+  trash tests use a temporary home and never the real Trash.
 - Fake executable scripts for vendor version, login, logout, and Codex JSONL.
 - Fake Claude executables that emit noninteractive JSON usage envelopes.
 - Fixed `Date` values for cache freshness, reset parsing, and human output.
@@ -44,7 +49,8 @@ The high-value test files are:
 | Change                                  | Start with                                                                     |
 | --------------------------------------- | ------------------------------------------------------------------------------ |
 | YAML schema, atomic writes, permissions | `test/config.test.ts`                                                          |
-| Registration, collector, purge          | `test/accounts.test.ts`                                                        |
+| Registration, collector, purge          | `test/accounts.test.ts`, `test/trash.test.ts`                                  |
+| Platform paths (macOS, Linux XDG)       | `test/paths.test.ts`                                                           |
 | Selection and sorting                   | `test/selectors.test.ts`                                                       |
 | Freshness and timestamp races           | `test/cache.test.ts`                                                           |
 | Process/signal cleanup                  | `test/processes.test.ts`                                                       |

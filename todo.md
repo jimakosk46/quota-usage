@@ -20,7 +20,6 @@ invariants in [`AGENTS.md`](AGENTS.md) when designing any item.
 
 ## Roadmap carried from the README
 
-- [ ] Linux support, including platform-specific paths and account-state behavior.
 - [ ] More providers through `ProviderAdapter`, without provider-specific logic
       leaking into collection or rendering.
 
