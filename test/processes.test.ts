@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
-import { childOwned, ProcessTracker, runProcess } from '../src/processes.js';
+import { childOwned, guardSignals, ProcessTracker, runProcess } from '../src/processes.js';
 
 describe('process ownership and cleanup', () => {
   it('terminates tracked children on cleanup but never touches untracked children', async () => {
@@ -87,6 +87,26 @@ describe('process ownership and cleanup', () => {
     expect(process.exitCode).toBe(143);
     remove2();
     process.exitCode = 0;
+  });
+
+  it('guards signals once until removed and restores the listener counts', () => {
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
+    const baseline = signals.map((signal) => process.listenerCount(signal));
+    const seen: string[] = [];
+    const remove = guardSignals(signals, (signal) => seen.push(signal));
+    expect(signals.map((signal) => process.listenerCount(signal))).toEqual(
+      baseline.map((count) => count + 1),
+    );
+    process.emit('SIGHUP', 'SIGHUP');
+    process.emit('SIGINT', 'SIGINT');
+    process.emit('SIGTERM', 'SIGTERM');
+    expect(seen).toEqual(['SIGHUP']);
+    // Later signals are absorbed by the still-installed listeners, not by Node's default exit.
+    expect(signals.map((signal) => process.listenerCount(signal))).toEqual(
+      baseline.map((count) => count + 1),
+    );
+    remove();
+    expect(signals.map((signal) => process.listenerCount(signal))).toEqual(baseline);
   });
 
   it('makes concurrent cleanup idempotent and handles signal exits', async () => {

@@ -17,6 +17,7 @@ export default defineConfig({
         'src/selectors.ts',
         'src/cache.ts',
         'src/processes.ts',
+        'src/trash.ts',
         'src/providers/**/*.ts',
       ],
       thresholds: { branches: 80 },

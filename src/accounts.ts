@@ -13,6 +13,7 @@ import {
   unlink,
   access,
 } from 'node:fs/promises';
+import { constants } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { accountDirectoryName } from './selectors.js';
@@ -32,7 +33,8 @@ import {
   defaultStateDir,
   ensurePrivateDir,
 } from './paths.js';
-import { childOwned, ProcessTracker, runProcess } from './processes.js';
+import { childOwned, guardSignals, ProcessTracker, runProcess } from './processes.js';
+import { prepareTrash, withLeftoverReservation, type TrashOptions } from './trash.js';
 import type { Confirm } from './prompt.js';
 import { CodexAdapter, identityHash, maskEmail } from './providers/codex.js';
 import { MIN_CLAUDE_MULTI_ACCOUNT_VERSION } from './providers/claude-live.js';
@@ -370,10 +372,35 @@ async function markerMatches(account: AccountConfig): Promise<boolean> {
   return marker?.id === account.ownershipMarker;
 }
 
+const PURGE_SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+const ignoreStreamError = (): void => {};
+
+/**
+ * After SIGHUP the terminal is gone, so a later stdout/stderr write fails asynchronously
+ * (EIO/EPIPE). Without a listener that 'error' becomes an uncaught exception and changes
+ * the exit status after cleanup. Idempotent; the listener stays until the process exits.
+ */
+function ignoreTerminalWriteErrors(): void {
+  for (const stream of [process.stdout, process.stderr]) {
+    if (!stream.listeners('error').includes(ignoreStreamError)) {
+      stream.on('error', ignoreStreamError);
+    }
+  }
+}
+
 export async function removeAccount(
   store: ConfigStore,
   selector: string,
-  options: { purge?: boolean; confirm: Confirm; tracker?: ProcessTracker },
+  options: {
+    purge?: boolean;
+    confirm: Confirm;
+    tracker?: ProcessTracker;
+    /** Test seam: chooses the trash flavour and preflight order; defaults to process.platform. */
+    platform?: NodeJS.Platform;
+    /** Test seam for injecting Trash filesystem failures. */
+    trashFs?: TrashOptions['fs'];
+  },
 ): Promise<{ messages: string[] }> {
   const match = /^(codex|claude):([a-z0-9_-]+)$/.exec(selector);
   if (!match)
@@ -407,24 +434,95 @@ export async function removeAccount(
       provider === 'codex' ? config.defaults.codexExecutable : config.defaults.claudeExecutable,
       provider,
     );
-    const logout = await runProcess(
-      executable,
-      provider === 'codex' ? ['logout'] : ['auth', 'logout'],
-      {
-        env: vendorEnvironment(provider, account.stateDir, process.env, {
-          claudeDefault: account.claudeDefault,
-        }),
-        timeoutMs: 30_000,
-        tracker,
-      },
-    );
-    if (logout.code !== 0) {
-      throw new UsageError('provider_failure', `${provider} logout failed; state was not moved`);
+    const platform = options.platform ?? process.platform;
+    const trashName = `usage-${provider}-${label}-${randomUUID()}`;
+    const trashOptions: TrashOptions = {
+      platform,
+      ...(options.trashFs === undefined ? {} : { fs: options.trashFs }),
+    };
+    const cancel = new AbortController();
+    // Linux holds a Trash reservation from preparation until commit; a signal in that
+    // window stops the owned logout and releases the reservation instead of orphaning it.
+    let unguard: (() => void) | undefined;
+    if (platform === 'linux') {
+      const removeGuard = guardSignals(PURGE_SIGNALS, (signal) => {
+        cancel.abort(signal);
+        process.exitCode = 128 + constants.signals[signal];
+        void tracker.cleanup();
+      });
+      // Any SIGHUP, not only the first signal, means the terminal is gone; this observer
+      // neither cancels again nor changes the first signal's exit status.
+      const onHangup = (): void => {
+        ignoreTerminalWriteErrors();
+      };
+      process.on('SIGHUP', onHangup);
+      unguard = () => {
+        removeGuard();
+        process.off('SIGHUP', onHangup);
+      };
     }
-    await ensurePrivateDir(store.paths.trashDir);
-    const trash = join(store.paths.trashDir, `usage-${provider}-${label}-${randomUUID()}`);
-    await rename(account.stateDir, trash);
-    messages.push(`Moved ${account.stateDir} to ${trash}; it is recoverable from Trash.`);
+    // A function, not a property read: TypeScript would keep the narrowing across awaits.
+    const cancelled = (): boolean => cancel.signal.aborted;
+    const interrupted = (tail: string): UsageError =>
+      new UsageError('provider_failure', `Interrupted by ${String(cancel.signal.reason)}; ${tail}`);
+    try {
+      // Linux validates and reserves the freedesktop Trash entry before logging out, so
+      // an unusable Trash is refused before the vendor session is touched. SIGKILL or
+      // power loss in this window can still leave an orphan .trashinfo; it is harmless,
+      // because its Path= names a directory that still exists at its original place.
+      const preflight =
+        platform === 'linux'
+          ? await prepareTrash(store.paths, account.stateDir, trashName, trashOptions)
+          : undefined;
+      try {
+        if (cancelled()) {
+          throw interrupted('the account was not logged out and its directory was not moved');
+        }
+        const logout = await runProcess(
+          executable,
+          provider === 'codex' ? ['logout'] : ['auth', 'logout'],
+          {
+            env: vendorEnvironment(provider, account.stateDir, process.env, {
+              claudeDefault: account.claudeDefault,
+            }),
+            timeoutMs: 30_000,
+            tracker,
+          },
+        );
+        // Checked before the exit code: a vendor may exit 0 on the same signal.
+        if (cancelled()) {
+          // Neither exit code proves the outcome: a vendor may revoke, then be killed.
+          throw interrupted(
+            'logout was interrupted and may have completed; the directory was not moved',
+          );
+        }
+        if (logout.code !== 0) {
+          throw new UsageError(
+            'provider_failure',
+            `${provider} logout failed; state was not moved`,
+          );
+        }
+      } catch (error) {
+        // Release the reservation on every logout failure (exit code, timeout, spawn error,
+        // signal). The logout error stays primary; if the release fails, it names the leftover file.
+        const leftover = await preflight?.abort().then(
+          () => undefined,
+          () => preflight.reservation,
+        );
+        throw leftover === undefined ? error : withLeftoverReservation(error, leftover);
+      }
+      // On Linux `preflight` exists, so nothing awaits between the last cancellation check
+      // and commit(); once the rename has started it is awaited and, if it succeeds, the
+      // reservation describes a real trashed item. The guard stays until commit() settles.
+      const move =
+        preflight ?? (await prepareTrash(store.paths, account.stateDir, trashName, trashOptions));
+      await move.commit();
+      messages.push(
+        `Moved ${account.stateDir} to ${move.destination}; it is recoverable from Trash.`,
+      );
+    } finally {
+      unguard?.();
+    }
   }
   const accounts = config.accounts.filter(
     (item) => item.provider !== provider || item.label !== label,

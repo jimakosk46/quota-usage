@@ -234,7 +234,8 @@ accounts
       process.stdout.write(`${result.messages.join('\n')}\n`);
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-      process.exitCode = 2;
+      // An interrupted Linux purge has already set 128 + signal number.
+      if (![129, 130, 143].includes(Number(process.exitCode))) process.exitCode = 2;
     }
   });
 

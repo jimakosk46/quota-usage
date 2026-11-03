@@ -74,6 +74,26 @@ export class ProcessTracker {
   }
 }
 
+/**
+ * Calls `onSignal` for the first of `signals` only; later signals are absorbed by the
+ * still-installed listeners instead of Node's default exit. Returns a remover.
+ */
+export function guardSignals(
+  signals: readonly NodeJS.Signals[],
+  onSignal: (signal: NodeJS.Signals) => void,
+): () => void {
+  let fired = false;
+  const handler = (signal: NodeJS.Signals): void => {
+    if (fired) return;
+    fired = true;
+    onSignal(signal);
+  };
+  for (const signal of signals) process.on(signal, handler);
+  return () => {
+    for (const signal of signals) process.off(signal, handler);
+  };
+}
+
 export interface RunResult {
   stdout: string;
   stderr: string;
